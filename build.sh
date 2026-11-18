@@ -4,6 +4,8 @@
 #   ./build.sh            sign with your Developer ID if one is in the keychain, else ad-hoc
 #   SIGN_ID=- ./build.sh  force ad-hoc signing
 #   ./build.sh --zip      also produce CaffeineOSS-<version>.zip for distribution
+#   NOTARY_PROFILE=<profile> ./build.sh --zip   …notarized and stapled (profile from
+#                         `xcrun notarytool store-credentials`)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -59,6 +61,13 @@ if [[ "${1:-}" == "--zip" ]]; then
   ZIP="CaffeineOSS-$VERSION.zip"
   rm -f "$ZIP"
   ditto -c -k --keepParent "$APP" "$ZIP"
+  if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+    echo "Notarizing (a few minutes)…"
+    xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun stapler staple "$APP"
+    rm -f "$ZIP" && ditto -c -k --keepParent "$APP" "$ZIP"
+    spctl --assess --type execute "$APP"
+  fi
   echo "Packaged: $(pwd)/$ZIP"
 fi
 
