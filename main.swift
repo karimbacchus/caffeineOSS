@@ -18,7 +18,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let menu = NSMenu()
     private let defaults = UserDefaults.standard
 
-    private var assertions: [IOPMAssertionID] = []
+    private var assertions: [IOPMAssertionID] = []     // system / idle / disk sleep
+    private var displayAssertion: IOPMAssertionID?      // dropped while the lid is shut
     private var expiry: Date?
     private var expiryTimer: Timer?
 
@@ -47,6 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Recover from a previous crash that left lid-sleep disabled.
         if lidSleepDisabled { setLidSleep(disabled: false) }
 
+        watchLid()
         menu.delegate = self
         if let button = statusItem.button {
             button.target = self
@@ -102,18 +104,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func activate(for duration: TimeInterval?) {
         if !isActive {
             assertions = [
-                kIOPMAssertPreventUserIdleDisplaySleep,
                 kIOPMAssertPreventUserIdleSystemSleep,
                 kIOPMAssertionTypePreventSystemSleep,
                 kIOPMAssertPreventDiskIdle,
-            ].compactMap { type in
-                var id = IOPMAssertionID(0)
-                let ok = IOPMAssertionCreateWithName(
-                    type as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn),
-                    "CaffeineOSS is keeping your Mac awake" as CFString, &id)
-                return ok == kIOReturnSuccess ? id : nil
-            }
+            ].compactMap(Self.assert)
             if lidMode { setLidSleep(disabled: true) }
+            lidChanged()
         }
 
         expiryTimer?.invalidate()
@@ -130,18 +126,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         expiryTimer?.invalidate()
         expiryTimer = nil
         expiry = nil
-        assertions.forEach { IOPMAssertionRelease($0) }
+        (assertions + [displayAssertion].compactMap { $0 }).forEach { IOPMAssertionRelease($0) }
         assertions.removeAll()
+        displayAssertion = nil
         if lidSleepDisabled { setLidSleep(disabled: false) }
         refresh()
     }
 
-    /// Runs `pmset -a disablesleep <0|1>` as root via the native admin prompt.
+    private static func assert(_ type: String) -> IOPMAssertionID? {
+        var id = IOPMAssertionID(0)
+        let ok = IOPMAssertionCreateWithName(type as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                             "CaffeineOSS is keeping your Mac awake" as CFString, &id)
+        return ok == kIOReturnSuccess ? id : nil
+    }
+
+    // MARK: Lid
+
+    /// Keeps the display on while the lid is open; lets it turn off while the lid is shut
+    /// (no point lighting a closed screen). Skipped with an external display, where the
+    /// user is working in clamshell mode and wants their monitor kept awake.
+    private func lidChanged() {
+        guard isActive else { return }
+        if Self.lidClosed && !Self.hasExternalDisplay {
+            guard let id = displayAssertion else { return }
+            IOPMAssertionRelease(id)
+            displayAssertion = nil
+            Self.run("/usr/bin/pmset", "displaysleepnow")
+        } else if displayAssertion == nil {
+            var wake = IOPMAssertionID(0)
+            IOPMAssertionDeclareUserActivity("CaffeineOSS lid opened" as CFString, kIOPMUserActiveLocal, &wake)
+            displayAssertion = Self.assert(kIOPMAssertPreventUserIdleDisplaySleep)
+        }
+    }
+
+    /// Subscribes to the power-management root domain's clamshell open/close messages.
+    private func watchLid() {
+        let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard root != 0, let port = IONotificationPortCreate(kIOMainPortDefault) else { return }
+        defer { IOObjectRelease(root) }
+        IONotificationPortSetDispatchQueue(port, .main)
+        var notifier = io_object_t(0)
+        IOServiceAddInterestNotification(port, root, "IOGeneralInterest", { refcon, _, message, _ in
+            guard message == 0xE003_4100, let refcon else { return } // kIOPMMessageClamshellStateChange
+            MainActor.assumeIsolated {
+                Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue().lidChanged()
+            }
+        }, Unmanaged.passUnretained(self).toOpaque(), &notifier)
+    }
+
+    private static var lidClosed: Bool {
+        let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        defer { IOObjectRelease(root) }
+        return IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)?
+            .takeRetainedValue() as? Bool ?? false
+    }
+
+    private static var hasExternalDisplay: Bool {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16), count: UInt32 = 0
+        CGGetActiveDisplayList(16, &ids, &count)
+        return ids.prefix(Int(count)).contains { CGDisplayIsBuiltin($0) == 0 }
+    }
+
+    @discardableResult
+    private static func run(_ path: String, _ args: String...) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
+
+    // MARK: Root
+
+    /// Runs `pmset -a disablesleep <0|1>` as root.
+    ///
+    /// The first time, this shows the admin prompt and also installs a sudoers rule that lets
+    /// this user run exactly those two pmset commands without a password — so every later
+    /// toggle is silent. Remove it any time with `sudo rm /etc/sudoers.d/caffeineoss`.
     private func setLidSleep(disabled: Bool) {
         guard disabled != lidSleepDisabled else { return }
-        let source = "do shell script \"/usr/bin/pmset -a disablesleep \(disabled ? 1 : 0)\" with administrator privileges"
+        let pmset = "/usr/bin/pmset -a disablesleep \(disabled ? 1 : 0)"
+
+        // Fast path: sudoers rule already installed → no prompt.
+        if Self.run("/usr/bin/sudo", "-n", "/usr/bin/pmset", "-a", "disablesleep", disabled ? "1" : "0") {
+            lidSleepDisabled = disabled
+            return
+        }
+
+        // One-time: admin prompt that installs the rule (validated by visudo) and runs pmset.
+        let rule = "\(NSUserName()) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"
+        let shell = """
+            f=$(/usr/bin/mktemp) && echo '\(rule)' > "$f" && /usr/sbin/visudo -cqf "$f" && \
+            /usr/bin/install -m 0440 -o root -g wheel "$f" /etc/sudoers.d/caffeineoss; /bin/rm -f "$f"; \(pmset)
+            """
+        let escaped = shell.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         var error: NSDictionary?
-        NSAppleScript(source: source)?.executeAndReturnError(&error)
+        NSAppleScript(source: "do shell script \"\(escaped)\" with administrator privileges")?.executeAndReturnError(&error)
         if error == nil { lidSleepDisabled = disabled }
     }
 

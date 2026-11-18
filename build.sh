@@ -9,7 +9,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="2.0.0"
+VERSION="2.0.1"
 APP="CaffeineOSS.app"
 MIN_OS="13.0"
 

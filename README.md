@@ -38,7 +38,8 @@ sudo pmset -a disablesleep 1   # also stop the forced sleep that happens when yo
 ```
 
 - It holds the same IOKit power assertions as `caffeinate -dims`, **in-process** — so if the app quits or crashes, macOS drops them automatically. No orphaned helper processes.
-- If **Stay Awake with Lid Closed** is on (default), it also flips `pmset disablesleep` so the Mac **stays awake even with the lid shut** (great for leaving `claude` running overnight). That part needs root, so you get a native admin prompt. Turn the option off in the menu if you never close the lid and want zero prompts.
+- If **Stay Awake with Lid Closed** is on (default), it also flips `pmset disablesleep` so the Mac **stays awake even with the lid shut** (great for leaving `claude` running overnight). That part needs root, so the **first** time you get one native admin prompt (Touch ID or password). It installs `/etc/sudoers.d/caffeineoss`, which lets your account run exactly `pmset -a disablesleep 0|1` and nothing else, so every toggle after that is silent. Or turn the option off in the menu if you never close the lid.
+- While the lid is shut, the display is allowed to turn off (no point lighting a closed screen); it comes straight back when you open the lid. With an external monitor connected (clamshell mode), displays are kept awake as usual.
 
 Everything is undone the moment you toggle off, when a timer expires, or when you quit. And if the app was ever force-killed while lid-sleep was disabled, it restores normal sleep on the next launch.
 
@@ -89,6 +90,7 @@ Right-click the cup → **Open at Login**. That registers a standard login item 
 # untick "Open at Login" in the menu first, then:
 osascript -e 'quit app "CaffeineOSS"'
 rm -rf CaffeineOSS.app
+sudo rm -f /etc/sudoers.d/caffeineoss   # the passwordless pmset rule, if installed
 ```
 
 ---
