@@ -1,145 +1,209 @@
 import Cocoa
+import IOKit.pwr_mgt
+import ServiceManagement
 
-// A tiny menu-bar "keep awake" app.
+// CaffeineOSS — a tiny menu-bar "keep awake" app.
 //
-// When active it does exactly what you'd type by hand:
-//   caffeinate -dimsu          → prevent display / idle / disk / system sleep + keep "user active"
-//   sudo pmset -a disablesleep 1  → also stop the forced sleep that happens when you CLOSE THE LID
+// Click the cup to toggle. Right-click (or ⌃-click) for timers and options.
 //
-// The plain IOKit assertion (what the old version did, == `caffeinate -d`) keeps the screen on
-// while the lid is open, but the Mac still sleeps the instant you shut the lid. `disablesleep`
-// is the only thing that defeats that — and it needs root, so we ask for admin once per toggle.
-//
-// Everything is undone when you toggle off, when a timer expires, or when you quit, so the
-// laptop can sleep normally again the moment you're done. ☕
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var statusItem: NSStatusItem!
-    private var caffeinate: Process?       // the live `caffeinate -dimsu` child
-    private var active = false
-    private var sleepDisabled = false      // did we successfully run `pmset disablesleep 1`?
-    private var autoOffTimer: Timer?
+// While active it holds the same IOKit power assertions as `caffeinate -dims`, in-process,
+// so the kernel drops them automatically if the app quits or crashes. Optionally it also runs
+// `pmset -a disablesleep 1` (one admin prompt) so the Mac stays awake with the lid closed.
+// That setting is persistent, so it is undone on toggle-off, timer expiry, quit, and — if the
+// app ever died without cleaning up — on the next launch.
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private let menu = NSMenu()
+    private let defaults = UserDefaults.standard
+
+    private var assertions: [IOPMAssertionID] = []
+    private var expiry: Date?
+    private var expiryTimer: Timer?
+
+    private var isActive: Bool { !assertions.isEmpty }
+
+    /// User preference: also defeat lid-close (clamshell) sleep. Needs admin.
+    private var lidMode: Bool {
+        get { defaults.object(forKey: "lidMode") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "lidMode") }
+    }
+
+    /// Persisted so a crash never leaves `disablesleep` stuck on.
+    private var lidSleepDisabled: Bool {
+        get { defaults.bool(forKey: "lidSleepDisabled") }
+        set { defaults.set(newValue, forKey: "lidSleepDisabled") }
+    }
+
+    private static let durations: [(String, TimeInterval)] = [
+        ("15 Minutes", 15 * 60), ("30 Minutes", 30 * 60), ("1 Hour", 3600),
+        ("2 Hours", 2 * 3600), ("5 Hours", 5 * 3600), ("8 Hours", 8 * 3600),
+    ]
+
+    // MARK: Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        updateIcon()
+        // Recover from a previous crash that left lid-sleep disabled.
+        if lidSleepDisabled { setLidSleep(disabled: false) }
 
-        let menu = NSMenu()
-        menu.addItem(withTitle: "Toggle (keep awake)", action: #selector(toggle), keyEquivalent: "t")
-        menu.addItem(.separator())
-        addDuration(to: menu, "Awake for 30 minutes", 30 * 60)
-        addDuration(to: menu, "Awake for 1 hour", 60 * 60)
-        addDuration(to: menu, "Awake for 2 hours", 2 * 60 * 60)
-        addDuration(to: menu, "Awake for 5 hours", 5 * 60 * 60)
-        menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit", action: #selector(quit), keyEquivalent: "q")
-        statusItem.menu = menu
+        menu.delegate = self
+        if let button = statusItem.button {
+            button.target = self
+            button.action = #selector(statusItemClicked)
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+        refresh()
     }
 
-    // Make sure we never leave the machine unable to sleep if we're killed/quit.
     func applicationWillTerminate(_ notification: Notification) {
-        stopAssertion()
+        deactivate()
     }
 
-    private func addDuration(to menu: NSMenu, _ title: String, _ seconds: TimeInterval) {
-        let item = NSMenuItem(title: title, action: #selector(activateFor(_:)), keyEquivalent: "")
-        item.representedObject = seconds
-        item.target = self
-        menu.addItem(item)
-    }
+    // MARK: Actions
 
-    @objc private func activateFor(_ sender: NSMenuItem) {
-        guard let seconds = sender.representedObject as? TimeInterval else { return }
-        if !active { startAssertion() }
-        autoOffTimer?.invalidate()
-        autoOffTimer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
-            self?.stopAssertion()
+    @objc private func statusItemClicked() {
+        let event = NSApp.currentEvent
+        if event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true {
+            statusItem.menu = menu          // attach just long enough to pop it up
+            statusItem.button?.performClick(nil)
+        } else {
+            toggle()
         }
     }
 
     @objc private func toggle() {
-        active ? stopAssertion() : startAssertion()
+        isActive ? deactivate() : activate(for: nil)
     }
 
-    @objc private func quit() {
-        stopAssertion()
-        NSApplication.shared.terminate(nil)
+    @objc private func activateForDuration(_ sender: NSMenuItem) {
+        activate(for: sender.representedObject as? TimeInterval)
     }
 
-    private func startAssertion() {
-        // 1) Hold the full set of sleep assertions via Apple's own tool, kept alive as a child
-        //    process for as long as we're active (no timeout, no utility → runs until we kill it).
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
-        p.arguments = ["-dimsu"]
+    @objc private func toggleLidMode() {
+        lidMode.toggle()
+        if isActive { setLidSleep(disabled: lidMode) }
+        refresh()
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        let service = SMAppService.mainApp
         do {
-            try p.run()
-            caffeinate = p
+            if service.status == .enabled { try service.unregister() } else { try service.register() }
         } catch {
-            caffeinate = nil
+            let alert = NSAlert(error: error)
+            alert.messageText = "Couldn’t change Open at Login"
+            alert.runModal()
         }
-
-        // 2) Defeat lid-close (clamshell) sleep. Needs root → one admin prompt.
-        sleepDisabled = setDisableSleep(true)
-
-        active = caffeinate != nil || sleepDisabled
-        updateIcon()
     }
 
-    private func stopAssertion() {
-        autoOffTimer?.invalidate()
-        autoOffTimer = nil
+    // MARK: Core
 
-        if let p = caffeinate, p.isRunning {
-            p.terminate()
+    private func activate(for duration: TimeInterval?) {
+        if !isActive {
+            assertions = [
+                kIOPMAssertPreventUserIdleDisplaySleep,
+                kIOPMAssertPreventUserIdleSystemSleep,
+                kIOPMAssertionTypePreventSystemSleep,
+                kIOPMAssertPreventDiskIdle,
+            ].compactMap { type in
+                var id = IOPMAssertionID(0)
+                let ok = IOPMAssertionCreateWithName(
+                    type as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                    "CaffeineOSS is keeping your Mac awake" as CFString, &id)
+                return ok == kIOReturnSuccess ? id : nil
+            }
+            if lidMode { setLidSleep(disabled: true) }
         }
-        caffeinate = nil
 
-        if sleepDisabled {
-            _ = setDisableSleep(false)
-            sleepDisabled = false
+        expiryTimer?.invalidate()
+        expiry = duration.map { Date(timeIntervalSinceNow: $0) }
+        if let duration {
+            expiryTimer = Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { [weak self] _ in
+                MainActor.assumeIsolated { self?.deactivate() }
+            }
         }
-
-        active = false
-        updateIcon()
+        refresh()
     }
 
-    /// Runs `pmset -a disablesleep <0|1>` as root via a native admin prompt.
-    /// Returns true on success (false if the user cancelled or it failed).
+    private func deactivate() {
+        expiryTimer?.invalidate()
+        expiryTimer = nil
+        expiry = nil
+        assertions.forEach { IOPMAssertionRelease($0) }
+        assertions.removeAll()
+        if lidSleepDisabled { setLidSleep(disabled: false) }
+        refresh()
+    }
+
+    /// Runs `pmset -a disablesleep <0|1>` as root via the native admin prompt.
+    private func setLidSleep(disabled: Bool) {
+        guard disabled != lidSleepDisabled else { return }
+        let source = "do shell script \"/usr/bin/pmset -a disablesleep \(disabled ? 1 : 0)\" with administrator privileges"
+        var error: NSDictionary?
+        NSAppleScript(source: source)?.executeAndReturnError(&error)
+        if error == nil { lidSleepDisabled = disabled }
+    }
+
+    // MARK: UI
+
+    private func refresh() {
+        guard let button = statusItem.button else { return }
+        let symbol = isActive ? "cup.and.saucer.fill" : "cup.and.saucer"
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: statusText)
+        button.toolTip = "\(statusText)\nClick to toggle · Right-click for options"
+    }
+
+    private var statusText: String {
+        guard isActive else { return "Sleep allowed" }
+        let lid = lidSleepDisabled ? ", even with lid closed" : ""
+        if let expiry {
+            return "Awake until \(expiry.formatted(date: .omitted, time: .shortened))\(lid)"
+        }
+        return "Awake indefinitely\(lid)"
+    }
+
+    /// Rebuilt each time it opens so the status line and checkmarks are always current.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+
+        let status = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
+        status.isEnabled = false
+        menu.addItem(status)
+        menu.addItem(.separator())
+
+        item(in: menu, isActive ? "Allow Sleep" : "Keep Awake", #selector(toggle), key: "t")
+
+        let timers = NSMenu()
+        for (title, seconds) in Self.durations {
+            item(in: timers, title, #selector(activateForDuration(_:))).representedObject = seconds
+        }
+        let timersItem = menu.addItem(withTitle: "Keep Awake For", action: nil, keyEquivalent: "")
+        timersItem.submenu = timers
+        menu.addItem(.separator())
+
+        item(in: menu, "Stay Awake with Lid Closed", #selector(toggleLidMode)).state = lidMode ? .on : .off
+        item(in: menu, "Open at Login", #selector(toggleLaunchAtLogin)).state =
+            SMAppService.mainApp.status == .enabled ? .on : .off
+        menu.addItem(.separator())
+
+        menu.addItem(withTitle: "Quit CaffeineOSS", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        statusItem.menu = nil              // so the next left-click toggles instead of opening the menu
+    }
+
     @discardableResult
-    private func setDisableSleep(_ on: Bool) -> Bool {
-        let value = on ? "1" : "0"
-        let script = "do shell script \"/usr/bin/pmset -a disablesleep \(value)\" with administrator privileges"
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        p.arguments = ["-e", script]
-        do {
-            try p.run()
-            p.waitUntilExit()
-            return p.terminationStatus == 0
-        } catch {
-            return false
-        }
-    }
-
-    private func updateIcon() {
-        // Filled cup = awake (active), outline cup = normal sleep allowed.
-        let name = active ? "cup.and.saucer.fill" : "cup.and.saucer"
-        let img = NSImage(systemSymbolName: name, accessibilityDescription: "Keep awake")
-        img?.isTemplate = true
-        statusItem.button?.image = img
-
-        if !active {
-            statusItem.button?.toolTip = "Sleep allowed — click to keep awake"
-        } else if sleepDisabled {
-            statusItem.button?.toolTip = "Awake (lid-close sleep off) — click to allow sleep"
-        } else {
-            statusItem.button?.toolTip = "Awake (lid open only) — click to allow sleep"
-        }
+    private func item(in menu: NSMenu, _ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
+        let item = menu.addItem(withTitle: title, action: action, keyEquivalent: key)
+        item.target = self
+        return item
     }
 }
 
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory) // menu-bar only, no Dock icon
 let delegate = AppDelegate()
 app.delegate = delegate
+app.setActivationPolicy(.accessory) // menu-bar only, no Dock icon
 app.run()

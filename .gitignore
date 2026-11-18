@@ -8,3 +8,4 @@ CaffeineOSS.app/
 # logs
 /tmp/caffeineoss.*.log
 *.log
+*.zip

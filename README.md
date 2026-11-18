@@ -37,33 +37,40 @@ caffeinate -dimsu              # prevent display / idle / disk / system sleep + 
 sudo pmset -a disablesleep 1   # also stop the forced sleep that happens when you CLOSE THE LID
 ```
 
-- It launches `caffeinate -dimsu` as a child process and keeps it alive for as long as you're awake.
-- It flips `pmset disablesleep` so the Mac **stays awake even with the lid shut** (great for leaving `claude` running overnight). That part needs root, so you get **one native admin prompt per toggle**.
+- It holds the same IOKit power assertions as `caffeinate -dims`, **in-process** — so if the app quits or crashes, macOS drops them automatically. No orphaned helper processes.
+- If **Stay Awake with Lid Closed** is on (default), it also flips `pmset disablesleep` so the Mac **stays awake even with the lid shut** (great for leaving `claude` running overnight). That part needs root, so you get a native admin prompt. Turn the option off in the menu if you never close the lid and want zero prompts.
 
-Everything is undone the moment you toggle off, when a timer expires, or when you quit — so the laptop sleeps normally again the second you're done.
+Everything is undone the moment you toggle off, when a timer expires, or when you quit. And if the app was ever force-killed while lid-sleep was disabled, it restores normal sleep on the next launch.
 
 > [!NOTE]
 > The first cut of this app only held a single `PreventUserIdleDisplaySleep` IOKit assertion (== `caffeinate -d`). That keeps the screen on while the lid is **open**, but the Mac still sleeps the instant you close the lid. `disablesleep` is the only thing that defeats clamshell sleep — which is why the lid-closed case now works.
 
+- 🖱 **Click** the cup to toggle. **Right-click** (or ⌃-click) for the menu.
 - 🟤 **Outline cup** = sleep allowed (normal)
-- ☕ **Filled cup** = staying awake (lid open *and* closed)
-- ⏱ **Timed modes** — awake for 30 min / 1 h / 2 h / 5 h, then auto-off
-- 🪶 **Featherweight** — one Swift file, zero dependencies, no Dock icon (menu-bar only)
+- ☕ **Filled cup** = staying awake — the menu shows *until when* and whether lid-close is covered
+- ⏱ **Timed modes** — 15 min / 30 min / 1 h / 2 h / 5 h / 8 h, then auto-off
+- 🚀 **Open at Login** — one checkbox (uses the modern `SMAppService` login item)
+- 🪟 **Liquid Glass ready** — native `NSMenu` + SF Symbols adopt the macOS 26/27 glass look automatically; glass-style app icon included
+- 🪶 **Featherweight** — one Swift file, zero dependencies, no Dock icon, universal binary (Apple silicon + Intel)
 
 ---
 
-## Install (build it yourself — that's the whole point)
+## Install
+
+**Download:** grab `CaffeineOSS-<version>.zip` from [Releases](https://github.com/karimbacchus/caffeineOSS/releases), unzip, move `CaffeineOSS.app` to `/Applications`, open it.
+
+### …or build it yourself (that's the whole point)
 
 You need the Xcode Command Line Tools (`xcode-select --install`). Then:
 
 ```bash
-git clone https://github.com/kuberwastaken/caffeineOSS.git
+git clone https://github.com/karimbacchus/caffeineOSS.git
 cd caffeineOSS
 ./build.sh
 open CaffeineOSS.app
 ```
 
-`build.sh` compiles `main.swift`, wraps it in a proper `.app` bundle, and **ad-hoc signs it locally** — so there's no quarantine flag for an MDM/Gatekeeper to choke on.
+`build.sh` compiles `main.swift` as a universal binary, wraps it in a proper `.app` bundle, and signs it — with your **Developer ID** (hardened runtime) if one is in your keychain, otherwise **ad-hoc**. Either way a local build has no quarantine flag for an MDM/Gatekeeper to choke on. `./build.sh --zip` also produces a release zip.
 
 > [!TIP]
 > Because you compiled it yourself, there's no `com.apple.quarantine` attribute and nothing for notarization gates to reject. This is exactly why it runs where the prebuilt apps didn't.
@@ -72,30 +79,15 @@ open CaffeineOSS.app
 
 ## Start at login (survives reboots)
 
-The clean way is a LaunchAgent — but if your MDM has locked down `~/Library/LaunchAgents` (mine had), use the per-user **Login Items** list instead, which doesn't need that directory:
-
-```bash
-osascript -e 'tell application "System Events" to make login item at end with properties {path:"'$PWD'/CaffeineOSS.app", hidden:true, name:"CaffeineOSS"}'
-```
-
-Verify it took:
-
-```bash
-osascript -e 'tell application "System Events" to get name of every login item'
-```
-
-You can also do this by hand in **System Settings → General → Login Items → +**.
+Right-click the cup → **Open at Login**. That registers a standard login item (no `~/Library/LaunchAgents` needed, so it works even when an MDM has locked that directory down). You can also manage it in **System Settings → General → Login Items**.
 
 ---
 
 ## Uninstall
 
 ```bash
-# stop it
+# untick "Open at Login" in the menu first, then:
 osascript -e 'quit app "CaffeineOSS"'
-# remove from login items
-osascript -e 'tell application "System Events" to delete login item "CaffeineOSS"'
-# delete the build
 rm -rf CaffeineOSS.app
 ```
 
@@ -119,10 +111,12 @@ CaffeineOSS is really just a friendly coffee cup glued on top of that idea.
 
 ```
 caffeineOSS/
-├── main.swift        # the entire app (~120 lines)
-├── build.sh          # compile → .app bundle → ad-hoc sign
+├── main.swift              # the entire app (~200 lines)
+├── build.sh                # compile (universal) → .app bundle → sign → optional zip
+├── scripts/make-icon.swift # renders assets/AppIcon.icns
 ├── assets/
-│   └── banner.svg    # the cup up top
+│   ├── AppIcon.icns        # glass-style app icon
+│   └── banner.svg          # the cup up top
 └── README.md
 ```
 
