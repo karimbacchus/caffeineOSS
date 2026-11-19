@@ -33,7 +33,7 @@ Leaving a download, a build, or an AI agent running? Click the cup and your Mac 
 
 ## Install
 
-1. Download **CaffeineOSS.zip** from [Releases](https://github.com/karimbacchus/caffeineOSS/releases/latest).
+1. Download the **CaffeineOSS zip** from [Releases](https://github.com/karimbacchus/caffeineOSS/releases/latest).
 2. Unzip it and drag **CaffeineOSS** into your Applications folder.
 3. Open it — a cup appears in your menu bar.
 
